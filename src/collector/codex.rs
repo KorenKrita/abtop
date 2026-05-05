@@ -47,10 +47,12 @@ impl CodexCollector {
         // Step 1: Find running codex processes from shared ps data (no extra ps call).
         // When MCP suppression is on, exclude `codex mcp-server` PIDs — those
         // are surfaced through the MCP servers panel instead. See issue #95.
-        let codex_pids =
-            Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids);
+        let codex_pids = Self::find_codex_pids_from_shared(
+            &shared.process_info,
+            &shared.mcp_server_pids,
+        );
         let just_pids: Vec<u32> = codex_pids.iter().map(|(p, _)| *p).collect();
-        let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids);
+        let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
         let pid_is_exec: HashMap<u32, bool> = codex_pids.into_iter().collect();
 
         let mut sessions = Vec::new();
@@ -174,9 +176,7 @@ impl CodexCollector {
         let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
         let display_pid = pid.unwrap_or(0);
 
-        let project_name = process::last_path_segment(&result.cwd)
-            .unwrap_or("?")
-            .to_string();
+        let project_name = process::last_path_segment(&result.cwd).unwrap_or("?").to_string();
 
         // Status detection
         // Note: Codex interactive sessions emit task_complete after every turn,
@@ -318,9 +318,15 @@ impl CodexCollector {
     /// Map codex PIDs to their open rollout-*.jsonl files.
     ///
     /// On Linux, scans /proc/{pid}/fd symlinks directly (no process spawn).
-    /// On Windows, uses sysinfo to get process cwd then scans for rollout files.
+    /// On Windows, scans ~/.codex/sessions/YYYY/MM/DD/ for recently modified
+    /// JSONL files and assigns them to discovered PIDs, since Windows has no
+    /// equivalent of lsof for enumerating open file descriptors.
     /// Falls back to lsof on macOS/other platforms.
-    fn map_pid_to_jsonl(pids: &[u32]) -> HashMap<u32, PathBuf> {
+    fn map_pid_to_jsonl(pids: &[u32], sessions_dir: &Path) -> HashMap<u32, PathBuf> {
+        // sessions_dir is consumed only by the windows arm below.
+        #[cfg(not(target_os = "windows"))]
+        let _ = sessions_dir;
+
         let mut map = HashMap::new();
         if pids.is_empty() {
             return map;
@@ -345,35 +351,40 @@ impl CodexCollector {
 
         #[cfg(target_os = "windows")]
         {
-            let mut sys = sysinfo::System::new();
-            let pids_sys: Vec<sysinfo::Pid> = pids
-                .iter()
-                .copied()
-                .map(|p| sysinfo::Pid::from(p as usize))
-                .collect();
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&pids_sys),
-                true,
-                sysinfo::ProcessRefreshKind::new().with_memory(),
-            );
-            for &pid_u32 in pids {
-                let pid = sysinfo::Pid::from(pid_u32 as usize);
-                if let Some(proc_) = sys.process(pid) {
-                    if let Some(cwd) = proc_.cwd() {
-                        if let Ok(entries) = fs::read_dir(&cwd) {
-                            for entry in entries.flatten() {
-                                let name = entry.file_name();
-                                let name_str = name.to_string_lossy();
-                                if name_str.starts_with("rollout-") && name_str.ends_with(".jsonl")
-                                {
-                                    map.insert(pid_u32, entry.path());
-                                    break;
-                                }
+            // Windows has no lsof or /proc/{pid}/fd to map PIDs to open files.
+            // Instead, scan today's ~/.codex/sessions/YYYY/MM/DD/ directory for
+            // rollout-*.jsonl files, then assign them to discovered codex PIDs.
+            // Prefer recently modified files, but fall back to any today's file
+            // since Codex may be idle (waiting for input) and not actively writing.
+            let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+
+            if let Some(today_dir) = Self::today_session_dir(sessions_dir) {
+                if let Ok(entries) = fs::read_dir(&today_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                            continue;
+                        }
+                        if let Ok(meta) = fs::metadata(&path) {
+                            if let Ok(modified) = meta.modified() {
+                                candidates.push((path, modified));
                             }
                         }
                     }
                 }
             }
+
+            // Sort by modification time descending (most recent first)
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+            // Assign candidates to PIDs (most recent file → first PID)
+            for (i, &pid_u32) in pids.iter().enumerate() {
+                if i < candidates.len() {
+                    map.insert(pid_u32, candidates[i].0.clone());
+                }
+            }
+
             map
         }
 
