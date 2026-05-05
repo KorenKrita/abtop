@@ -323,6 +323,10 @@ impl CodexCollector {
     /// equivalent of lsof for enumerating open file descriptors.
     /// Falls back to lsof on macOS/other platforms.
     fn map_pid_to_jsonl(pids: &[u32], sessions_dir: &Path) -> HashMap<u32, PathBuf> {
+        // sessions_dir is consumed only by the windows arm below.
+        #[cfg(not(target_os = "windows"))]
+        let _ = sessions_dir;
+
         let mut map = HashMap::new();
         if pids.is_empty() {
             return map;
